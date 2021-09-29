@@ -27,7 +27,7 @@ example =
               , { "nodeType": "text"
                 , "value": "important"
                 , "data": {}
-                , "marks": [ "type": "bold" ]
+                , "marks": [ { "type": "bold" } ]
                 }
               ]
           }
