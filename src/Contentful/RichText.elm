@@ -1,4 +1,4 @@
-module Contentful.RichText exposing (decoder, toMarkdown)
+module Contentful.RichText exposing (Encoder, Marks, RichText, Spans, decoder, encode)
 
 import Json.Decode as Decode exposing (Decoder)
 
@@ -13,7 +13,7 @@ type RichText
 
 type TopLevelBlock
     = MainBlock MainBlock
-    | Table TableData
+    | TableBlock TableData
 
 
 
@@ -23,7 +23,7 @@ type TopLevelBlock
 type MainBlock
     = ParagraphBlock Paragraph
     | Heading HeadingLevel InlineContent
-    | ListBlock ListType (List (List MainBlock))
+    | ListBlock ListType (List ListItemData)
     | HorizontalRule
     | QuoteBlock (List Paragraph)
     | EmbeddedAsset Id
@@ -31,7 +31,7 @@ type MainBlock
 
 
 type Paragraph
-    = Paragraph InlineContent
+    = Para InlineContent
 
 
 type HeadingLevel
@@ -48,6 +48,10 @@ type ListType
     | Unordered
 
 
+type alias ListItemData =
+    List MainBlock
+
+
 
 -- Inline nodes
 
@@ -62,9 +66,9 @@ type Inline
 
 
 type Link
-    = Hyperlink Uri (List Text)
-    | EntryHyperlink Id (List Text)
-    | AssetHyperlink Id (List Text)
+    = Anchor Uri (List Text)
+    | EntryLink Id (List Text)
+    | AssetLink Id (List Text)
     | EntryInline Id
 
 
@@ -110,8 +114,8 @@ type CellType
 
 
 type alias Spans =
-    { colspan : Int
-    , rowspan : Int
+    { col : Int
+    , row : Int
     }
 
 
@@ -126,7 +130,7 @@ decoder =
             Decode.list <|
                 Decode.oneOf
                     [ Decode.map MainBlock mainBlockDecoder
-                    , Decode.map Table tableDataDecoder
+                    , Decode.map TableBlock tableDataDecoder
                     ]
 
 
@@ -151,7 +155,7 @@ mainBlockDecoder =
 
 paragraphDecoder : Decoder Paragraph
 paragraphDecoder =
-    Decode.map Paragraph <|
+    Decode.map Para <|
         node "paragraph" inlineContentDecoder
 
 
@@ -202,9 +206,9 @@ marksDecoder =
 linkDecoder : Decoder Link
 linkDecoder =
     Decode.oneOf
-        [ nodeWithData "hyperlink" Hyperlink (Decode.field "uri" Decode.string) (Decode.list textDecoder)
-        , nodeWithData "entry-hyperlink" EntryHyperlink (linkDataDecoder "Entry") (Decode.list textDecoder)
-        , nodeWithData "asset-hyperlink" AssetHyperlink (linkDataDecoder "Asset") (Decode.list textDecoder)
+        [ nodeWithData "hyperlink" Anchor (Decode.field "uri" Decode.string) (Decode.list textDecoder)
+        , nodeWithData "entry-hyperlink" EntryLink (linkDataDecoder "Entry") (Decode.list textDecoder)
+        , nodeWithData "asset-hyperlink" AssetLink (linkDataDecoder "Asset") (Decode.list textDecoder)
         , nodeWithData "embedded-entry-inline" (always << EntryInline) (linkDataDecoder "Entry") emptyList
         ]
 
@@ -294,180 +298,278 @@ emptyList =
 
 
 
--- MARKDOWN
+-- ENCODE
 
 
-toMarkdown : RichText -> String
-toMarkdown (RichText topLevel) =
-    List.indexedMap topLevelToMarkdown topLevel
-        |> String.join "\n\n"
+type alias Encoder inline block doc =
+    { document : List block -> doc
+
+    -- blocks
+    , blockquote : Context -> List block -> block
+    , embeddedAsset : Context -> String -> block
+    , embeddedEntry : Context -> String -> block
+    , heading1 : Context -> List inline -> block
+    , heading2 : Context -> List inline -> block
+    , heading3 : Context -> List inline -> block
+    , heading4 : Context -> List inline -> block
+    , heading5 : Context -> List inline -> block
+    , heading6 : Context -> List inline -> block
+    , hr : Context -> block
+    , listItem : Context -> List block -> block
+    , orderedList : Context -> List block -> block
+    , unorderedList : Context -> List block -> block
+    , paragraph : Context -> List inline -> block
+
+    -- table blocks
+    , table : Context -> List block -> block
+    , tableRow : Context -> List block -> block
+    , tableHeaderCell : Context -> Spans -> List block -> block
+    , tableCell : Context -> Spans -> List block -> block
+
+    -- inlines
+    , text : Context -> Marks -> String -> inline
+    , assetHyperlink : Context -> String -> List inline -> inline
+    , entryHyperlink : Context -> String -> List inline -> inline
+    , hyperlink : Context -> String -> List inline -> inline
+    , embeddedEntryInline : Context -> String -> inline
+    }
 
 
-topLevelToMarkdown : Int -> TopLevelBlock -> String
-topLevelToMarkdown blockNumber topLevelBlock =
+type alias Context =
+    { depth : Int
+    , container : Container
+    , ancestors : List Ancestor
+    , siblingsBefore : Int
+    , siblingsAfter : Int
+    }
+
+
+type alias Ancestor =
+    { container : Container
+    , siblingsBefore : Int
+    , siblingsAfter : Int
+    }
+
+
+
+-- type alias TableContext =
+--     { table :
+--         { siblingsBefore : Int
+--         , siblingsAfter : Int
+--         , rows : Int
+--         , columns : Int
+--         }
+--     , colspan : Int
+--     , rowspan : Int
+--     , row : Int
+--     , column : Int
+--     }
+
+
+type Container
+    = Document
+    | Paragraph
+    | Heading1
+    | Heading2
+    | Heading3
+    | Heading4
+    | Heading5
+    | Heading6
+    | UnorderedList
+    | OrderedList
+    | ListItem
+    | Blockquote
+    | Hyperlink
+    | EntryHyperlink
+    | AssetHyperlink
+    | Table
+    | TableRow
+    | TableCell
+    | TableHeaderCell
+
+
+initContext : Int -> Int -> Context
+initContext total pos =
+    { depth = 0
+    , container = Document
+    , ancestors = []
+    , siblingsBefore = pos
+    , siblingsAfter = total - pos
+    }
+
+
+pushContext : Context -> Container -> Int -> Int -> Context
+pushContext parent parentType total pos =
+    { depth = parent.depth + 1
+    , container = parentType
+    , ancestors = Ancestor parent.container parent.siblingsBefore parent.siblingsAfter :: parent.ancestors
+    , siblingsBefore = pos
+    , siblingsAfter = total - pos
+    }
+
+
+encode : Encoder inline block doc -> RichText -> doc
+encode encoder (RichText topLevelBlocks) =
+    List.indexedMap (encodeTopLevelBlock encoder << initContext (List.length topLevelBlocks)) topLevelBlocks
+        |> encoder.document
+
+
+encodeTopLevelBlock : Encoder inline block doc -> Context -> TopLevelBlock -> block
+encodeTopLevelBlock encoder context topLevelBlock =
     case topLevelBlock of
         MainBlock mainBlock ->
-            mainBlockToMarkdown mainBlock
-                |> String.join "\n\n"
+            encodeMainBlock encoder context mainBlock
 
-        Table tableData ->
-            tableDataToMarkdown blockNumber tableData
+        TableBlock rows ->
+            encodeTable encoder context rows
 
 
-mainBlockToMarkdown : MainBlock -> List String
-mainBlockToMarkdown mainBlock =
+encodeMainBlock : Encoder inline block doc -> Context -> MainBlock -> block
+encodeMainBlock encoder context mainBlock =
     case mainBlock of
         ParagraphBlock paragraph ->
-            [ paragraphToMarkdown paragraph ]
+            encodeParagraph encoder context paragraph
 
         Heading level inlineContent ->
-            [ headingToMarkdown level inlineContent ]
+            encodeHeading level encoder context inlineContent
 
         ListBlock listType listItems ->
-            listToMarkdown listType listItems
+            encodeListBlock listType encoder context listItems
 
         HorizontalRule ->
-            [ "---" ]
+            encoder.hr context
 
         QuoteBlock paragraphs ->
-            quoteBlockToMarkdown paragraphs
+            encodeQuoteBlock encoder context paragraphs
 
         EmbeddedAsset id ->
-            [ "{{ embeddedAsset " ++ id ++ " }}" ]
+            encoder.embeddedAsset context id
 
         EmbeddedEntry id ->
-            [ "{{ embeddedEntry " ++ id ++ " }}" ]
+            encoder.embeddedEntry context id
 
 
-paragraphToMarkdown : Paragraph -> String
-paragraphToMarkdown (Paragraph inlineContent) =
-    inlineContentToMarkdown inlineContent
+encodeParagraph : Encoder inline block doc -> Context -> Paragraph -> block
+encodeParagraph encoder context (Para inlineContent) =
+    encodeInlineContent encoder context Paragraph inlineContent
+        |> encoder.paragraph context
 
 
-headingToMarkdown : HeadingLevel -> InlineContent -> String
-headingToMarkdown level inlineContent =
-    hashes level ++ inlineContentToMarkdown inlineContent
-
-
-hashes : HeadingLevel -> String
-hashes level =
-    case level of
-        One ->
-            "# "
-
-        Two ->
-            "## "
-
-        Three ->
-            "### "
-
-        Four ->
-            "#### "
-
-        Five ->
-            "##### "
-
-        Six ->
-            "###### "
-
-
-listToMarkdown : ListType -> List (List MainBlock) -> List String
-listToMarkdown listType =
-    List.concat << List.map (listItem listType)
-
-
-listItem : ListType -> List MainBlock -> List String
-listItem listType items =
+encodeHeading : HeadingLevel -> Encoder inline block doc -> Context -> InlineContent -> block
+encodeHeading level encoder context inlineContent =
     let
-        unindented =
-            items
-                |> List.map mainBlockToMarkdown
-                |> List.intersperse [ "" ]
-                |> List.concat
+        ( container, encoderHeader ) =
+            case level of
+                One ->
+                    ( Heading1, encoder.heading1 )
+
+                Two ->
+                    ( Heading2, encoder.heading2 )
+
+                Three ->
+                    ( Heading3, encoder.heading3 )
+
+                Four ->
+                    ( Heading4, encoder.heading4 )
+
+                Five ->
+                    ( Heading5, encoder.heading5 )
+
+                Six ->
+                    ( Heading6, encoder.heading6 )
     in
-    case unindented of
-        head :: rest ->
-            (listTypeToMarkdown listType ++ head) :: List.map ((++) "   ") rest
-
-        [] ->
-            []
+    encodeInlineContent encoder context container inlineContent
+        |> encoderHeader context
 
 
-listTypeToMarkdown : ListType -> String
-listTypeToMarkdown listType =
-    case listType of
-        Ordered ->
-            "1. "
+encodeListBlock : ListType -> Encoder inline block doc -> Context -> List ListItemData -> block
+encodeListBlock listType encoder context listItems =
+    let
+        ( container, encoderList ) =
+            case listType of
+                Unordered ->
+                    ( UnorderedList, encoder.unorderedList )
 
-        Unordered ->
-            "*  "
-
-
-quoteBlockToMarkdown : List Paragraph -> List String
-quoteBlockToMarkdown =
-    List.map paragraphToMarkdown
-        >> List.intersperse ""
-        >> List.map ((++) "> ")
+                Ordered ->
+                    ( OrderedList, encoder.orderedList )
+    in
+    List.indexedMap (encodeListItem encoder << pushContext context container (List.length listItems)) listItems
+        |> encoderList context
 
 
-inlineContentToMarkdown : InlineContent -> String
-inlineContentToMarkdown =
-    List.map inlineToMarkdown
-        >> String.join ""
+encodeListItem : Encoder inline block doc -> Context -> ListItemData -> block
+encodeListItem encoder context mainBlocks =
+    List.indexedMap (encodeMainBlock encoder << pushContext context ListItem (List.length mainBlocks)) mainBlocks
+        |> encoder.listItem context
 
 
-inlineToMarkdown : Inline -> String
-inlineToMarkdown inline =
+encodeQuoteBlock : Encoder inline block doc -> Context -> List Paragraph -> block
+encodeQuoteBlock encoder context paragraphs =
+    List.indexedMap (encodeParagraph encoder << pushContext context Blockquote (List.length paragraphs)) paragraphs
+        |> encoder.blockquote context
+
+
+encodeInlineContent : Encoder inline block doc -> Context -> Container -> InlineContent -> List inline
+encodeInlineContent encoder context container inlineContent =
+    List.indexedMap (encodeInline encoder << pushContext context container (List.length inlineContent)) inlineContent
+
+
+encodeInline : Encoder inline block doc -> Context -> Inline -> inline
+encodeInline encoder context inline =
     case inline of
-        Link link ->
-            linkToMarkdown link
-
         Text text ->
-            textToMarkdown text
+            encodeText encoder context text
+
+        Link link ->
+            encodeLink encoder context link
 
 
-textToMarkdown : Text -> String
-textToMarkdown (WithMarks marks content) =
-    let
-        wrap =
-            marksToMarkdown marks
-    in
-    wrap ++ content ++ String.reverse wrap
-
-
-marksToMarkdown : Marks -> String
-marksToMarkdown { bold, code, underline, italic } =
-    let
-        f bool str =
-            if bool then
-                str
-
-            else
-                ""
-    in
-    f bold "**" ++ f italic "*" ++ f underline "_" ++ f code "`"
-
-
-linkToMarkdown : Link -> String
-linkToMarkdown link =
-    let
-        f texts =
-            String.concat (List.map textToMarkdown texts)
-    in
+encodeLink : Encoder inline block doc -> Context -> Link -> inline
+encodeLink encoder context link =
     case link of
-        Hyperlink uri content ->
-            "[" ++ f content ++ "](" ++ uri ++ ")"
+        Anchor uri texts ->
+            List.indexedMap (encodeText encoder << pushContext context Hyperlink (List.length texts)) texts
+                |> encoder.hyperlink context uri
 
-        EntryHyperlink id content ->
-            "[" ++ f content ++ "]({{ entryLink " ++ id ++ " }})"
+        EntryLink id texts ->
+            List.indexedMap (encodeText encoder << pushContext context EntryHyperlink (List.length texts)) texts
+                |> encoder.entryHyperlink context id
 
-        AssetHyperlink id content ->
-            "[" ++ f content ++ "]({{ assetLink " ++ id ++ " }})"
+        AssetLink id texts ->
+            List.indexedMap (encodeText encoder << pushContext context AssetHyperlink (List.length texts)) texts
+                |> encoder.assetHyperlink context id
 
         EntryInline id ->
-            "{{ inlineEntry " ++ id ++ " }}"
+            encoder.embeddedEntryInline context id
 
 
-tableDataToMarkdown : Int -> TableData -> String
-tableDataToMarkdown blockNumber tableData =
-    "{{ table " ++ String.fromInt blockNumber ++ " }}"
+encodeText : Encoder inline block doc -> Context -> Text -> inline
+encodeText encoder context (WithMarks marks string) =
+    encoder.text context marks string
+
+
+encodeTable : Encoder inline block doc -> Context -> TableData -> block
+encodeTable encoder context rows =
+    List.indexedMap (encodeRow encoder << pushContext context Table (List.length rows)) rows
+        |> encoder.table context
+
+
+encodeRow : Encoder inline block doc -> Context -> Row -> block
+encodeRow encoder context row =
+    List.indexedMap (encodeCell encoder << pushContext context TableRow (List.length row)) row
+        |> encoder.tableRow context
+
+
+encodeCell : Encoder inline block doc -> Context -> Cell -> block
+encodeCell encoder context (Cell cellType spans paragraphs) =
+    let
+        ( container, encoderCell ) =
+            case cellType of
+                Header ->
+                    ( TableHeaderCell, encoder.tableHeaderCell )
+
+                Data ->
+                    ( TableCell, encoder.tableCell )
+    in
+    List.indexedMap (encodeParagraph encoder << pushContext context container (List.length paragraphs)) paragraphs
+        |> encoderCell context spans
