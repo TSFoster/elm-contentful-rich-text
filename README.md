@@ -37,6 +37,16 @@ import Html exposing (Html)
 import Html.Attributes exposing (rowspan, colspan)
 import Contentful.RichText exposing (Encoder, Marks, Spans)
 
+{-
+import Html.Lazy
+
+viewRichText =
+    Contentful.RichText.encode htmlEncoder
+
+view model =
+    Html.Lazy.lazy viewRichText model.richText
+-}
+
 htmlEncoder : Encoder (Html msg) (Html msg) (Html msg)
 htmlEncoder =
     { document = Html.div []
